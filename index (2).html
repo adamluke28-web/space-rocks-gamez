@@ -1,0 +1,721 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Space Rocks</title>
+<style>
+  /* Layout: one centered game column, dark space look kept in both themes */
+  :root {
+    --bg: #05050f;
+    --fg: #f2f4ff;
+    --muted: #a9acc9;
+    --line: #2a2a55;
+    --pod: #4dff9a;
+    color-scheme: dark;
+  }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-family: system-ui, -apple-system, "Segoe UI", sans-serif; padding-block: 12px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+  .wrap { max-width: 900px; margin: 0 auto; text-align: center; }
+  h1 { margin: 8px 0 4px; font-size: 2rem; letter-spacing: 2px; text-wrap: balance; }
+  p.sub { margin: 0 0 10px; color: var(--muted); font-size: .95rem; line-height: 1.5; }
+  p.sub b { color: var(--pod); }
+  canvas { display: block; width: 100%; height: auto; border-radius: 10px; background: var(--bg); border: 1px solid var(--line); outline: none; }
+  canvas:focus-visible { border-color: var(--pod); }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <h1>SPACE ROCKS</h1>
+  <p class="sub">Click the game once, then use the arrow keys to fly &nbsp;|&nbsp; Space to shoot (hold for rapid fire) &nbsp;|&nbsp; M mute all &nbsp;|&nbsp; N music on/off<br>Don't let a rock get past the left edge, and <b>don't shoot the green supply pods!</b></p>
+  <canvas id="c" width="900" height="520" tabindex="0"></canvas>
+</div>
+<script>
+(() => {
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+
+  // ---- Tuning: change these to adjust difficulty ----
+  const COIN_CHANCE = 0.35;        // chance a small rock drops a coin (big rocks always drop 2)
+  const ROUND_BONUS = 2;           // coins awarded for clearing a round
+  const ROCK_BASE_SPEED = 90;      // round 1 rock speed
+  const ROCK_SPEED_PER_ROUND = 28; // added each round
+  const SPAWN_BASE = 1.4;          // seconds between rocks in round 1
+  const SPAWN_DROP_PER_ROUND = 0.12;
+  const SPAWN_MIN = 0.35;
+  const QUOTA_BASE = 8, QUOTA_PER_ROUND = 4; // rocks to destroy per round
+  const MAX_STRIKES = 3;           // shooting this many friendly pods ends the game
+  const FRIEND_CHANCE = 0.18;      // chance each spawn is a friendly pod
+  const FRIEND_PENALTY = 30;       // points lost for shooting a pod
+
+  const keys = {};
+  let ship, bullets, rocks, friends = [], coins = [], stars, particles, strikes = 0;
+  let round, destroyed, quota, spawnTimer, fireTimer, score, best = 0;
+  let state = 'ready', bannerTime = 0, deadReason = '';
+
+  try { best = +localStorage.getItem('spaceRocksBest') || 0; } catch (e) {}
+
+  const rand = (a, b) => a + Math.random() * (b - a);
+
+  // ---- Sound (synthesized with Web Audio, no files needed) ----
+  let actx = null, muted = false, noiseBuf = null;
+  function initAudio() {
+    if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
+    try {
+      actx = new (window.AudioContext || window.webkitAudioContext)();
+      noiseBuf = actx.createBuffer(1, actx.sampleRate * 0.6, actx.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    } catch (e) { actx = null; }
+  }
+  function tone(type, f0, f1, dur, vol, delay = 0) {
+    if (!actx || muted) return;
+    const t0 = actx.currentTime + delay;
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f0, t0);
+    o.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t0 + dur);
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(t0); o.stop(t0 + dur + 0.02);
+  }
+  function noise(dur, vol, f0, f1, delay = 0) {
+    if (!actx || muted) return;
+    const t0 = actx.currentTime + delay;
+    const s = actx.createBufferSource(); s.buffer = noiseBuf; s.loop = true;
+    const f = actx.createBiquadFilter(); f.type = 'lowpass';
+    f.frequency.setValueAtTime(f0, t0);
+    f.frequency.exponentialRampToValueAtTime(Math.max(50, f1), t0 + dur);
+    const g = actx.createGain();
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    s.connect(f); f.connect(g); g.connect(actx.destination);
+    s.start(t0); s.stop(t0 + dur + 0.02);
+  }
+  const sfx = {
+    blast()  { tone('square', 900, 180, 0.12, 0.07); tone('sawtooth', 450, 90, 0.1, 0.05); },
+    hit()    { tone('triangle', 300, 140, 0.08, 0.12); noise(0.08, 0.1, 3000, 800); },
+    shatter(big) { noise(big ? 0.5 : 0.35, 0.35, 3500, 120); tone('sine', big ? 140 : 180, 40, big ? 0.4 : 0.3, 0.35); },
+    strike() { tone('sawtooth', 240, 70, 0.45, 0.15); tone('square', 120, 60, 0.45, 0.08); },
+    round()  { [523, 659, 784, 1047].forEach((f, i) => tone('square', f, f, 0.14, 0.06, i * 0.1)); },
+    over()   { noise(0.9, 0.4, 2500, 80); tone('sawtooth', 300, 40, 0.9, 0.15); },
+    coin()   { tone('sine', 988, 1319, 0.09, 0.08); tone('triangle', 1319, 1319, 0.12, 0.06, 0.06); },
+    unlock() { [659, 784, 988, 1319].forEach((f, i) => tone('triangle', f, f, 0.18, 0.09, i * 0.09)); },
+    deny()   { tone('square', 180, 110, 0.15, 0.07); }
+  };
+
+  // ---- Background music: soft generated space themes that rotate ----
+  const MUSIC_VOL = 0.5;
+  let musicOff = false;
+  const QUAL = { m: [0, 3, 7], M: [0, 4, 7], m7: [0, 3, 7, 10], M7: [0, 4, 7, 11] };
+  // root = midi note, prog = [semitone offset from root, chord quality] per bar
+  const TRACKS = [
+    { name: 'Drifting',      bpm: 80, root: 57, prog: [[0, 'm7'], [-4, 'M7'], [3, 'M'], [-2, 'M']] },
+    { name: 'Nebula',        bpm: 92, root: 50, prog: [[0, 'm'], [-4, 'M'], [5, 'm'], [7, 'M']] },
+    { name: 'Orbit',         bpm: 88, root: 52, prog: [[0, 'm'], [3, 'M'], [-2, 'M'], [-4, 'M']] },
+    { name: 'Starfield',     bpm: 96, root: 48, prog: [[0, 'M7'], [-3, 'm7'], [5, 'M7'], [7, 'M']] },
+    { name: 'Event Horizon', bpm: 76, root: 53, prog: [[0, 'm'], [-2, 'M'], [-4, 'M'], [-5, 'M']] }
+  ];
+  const ARPS = [
+    [0, null, 2, null, 1, null, 2, null],
+    [0, 1, 2, 1, 0, 1, 2, 1],
+    [0, null, 1, 2, null, 3, 2, null],
+    [2, null, 1, null, 0, null, 1, 2]
+  ];
+  const music = { on: false, bus: null, timer: null, track: null, trackIdx: -1, bars: 0, nextTime: 0, switchNow: true };
+  const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
+  const musicTarget = () => (muted || musicOff) ? 0 : MUSIC_VOL;
+
+  function makeBus() {
+    const g = actx.createGain(); g.gain.value = 0; g.connect(actx.destination);
+    const send = actx.createGain(); send.gain.value = 0.45;
+    const dl = actx.createDelay(2); dl.delayTime.value = 0.5;
+    const fb = actx.createGain(); fb.gain.value = 0.38;
+    const lp = actx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1800;
+    send.connect(dl); dl.connect(lp); lp.connect(fb); fb.connect(dl); lp.connect(g);
+    g.gain.setTargetAtTime(musicTarget(), actx.currentTime, 0.6);
+    return { g, send, dl, fb, lp };
+  }
+
+  // one enveloped note: fade in, hold, fade out
+  function note(type, freq, t, attack, hold, release, vol, dest) {
+    const o = actx.createOscillator(), e = actx.createGain();
+    o.type = type; o.frequency.value = freq;
+    e.gain.setValueAtTime(0.0001, t);
+    e.gain.linearRampToValueAtTime(vol, t + attack);
+    e.gain.setValueAtTime(vol, t + attack + hold);
+    e.gain.exponentialRampToValueAtTime(0.0001, t + attack + hold + release);
+    o.connect(e); e.connect(dest);
+    o.start(t); o.stop(t + attack + hold + release + 0.05);
+  }
+
+  function pickTrack() {
+    let i;
+    do { i = Math.floor(Math.random() * TRACKS.length); } while (i === music.trackIdx);
+    music.trackIdx = i; music.track = TRACKS[i]; music.bars = 0; music.switchNow = false;
+    music.bus.dl.delayTime.setValueAtTime(60 / music.track.bpm * 0.75, actx.currentTime);
+  }
+
+  function scheduleBar(t0) {
+    if (music.switchNow || music.bars >= 8 || !music.track) pickTrack();
+    const tr = music.track, beat = 60 / tr.bpm, barLen = beat * 4, bus = music.bus;
+    const [off, q] = tr.prog[music.bars % tr.prog.length];
+    const chord = QUAL[q], rootNote = tr.root + off;
+
+    // warm pad: held chord tones with slow fades so bars blend together
+    const padFilter = actx.createBiquadFilter();
+    padFilter.type = 'lowpass'; padFilter.frequency.value = 1100;
+    padFilter.connect(bus.g);
+    for (let i = 0; i < 3; i++) {
+      note('sine', mtof(rootNote + chord[i] + (i === 0 ? 0 : 12)), t0, 1.0, barLen - 1.2, 1.4, 0.05, padFilter);
+    }
+    // soft bass on beats 1 and 3
+    note('sine', mtof(rootNote - 12), t0, 0.04, beat * 1.2, beat * 0.8, 0.14, bus.g);
+    note('sine', mtof(rootNote - 12), t0 + beat * 2, 0.04, beat * 0.8, beat * 0.6, 0.08, bus.g);
+    // gentle arpeggio with an echo; skipped now and then so it breathes
+    if (Math.random() > 0.15) {
+      const pat = ARPS[Math.floor(Math.random() * ARPS.length)];
+      pat.forEach((idx, st) => {
+        if (idx === null) return;
+        const n = rootNote + 12 + chord[idx % chord.length] + 12 * Math.floor(idx / chord.length);
+        const t = t0 + st * beat / 2;
+        note('triangle', mtof(n), t, 0.01, 0.02, beat, 0.05, bus.g);
+        note('triangle', mtof(n), t, 0.01, 0.02, beat, 0.03, bus.send);
+      });
+    }
+    // occasional high twinkle
+    if (music.bars % 2 === 1 && Math.random() < 0.6) {
+      const n = rootNote + 24 + chord[Math.floor(Math.random() * chord.length)];
+      note('sine', mtof(n), t0 + beat * (1 + Math.floor(Math.random() * 3)), 0.02, 0.3, 1.6, 0.03, bus.send);
+    }
+    music.nextTime = t0 + barLen;
+    music.bars++;
+  }
+
+  function musicTick() {
+    if (!music.on || !actx) return;
+    while (music.nextTime < actx.currentTime + 1.5) scheduleBar(music.nextTime);
+  }
+
+  function startMusic() {
+    if (!actx || music.on) return;
+    music.on = true; music.switchNow = true; music.bars = 0;
+    music.bus = makeBus();
+    music.nextTime = actx.currentTime + 0.15;
+    musicTick();
+    music.timer = setInterval(musicTick, 250);
+  }
+
+  function stopMusic() {
+    if (!music.on) return;
+    music.on = false; clearInterval(music.timer);
+    const b = music.bus;
+    b.g.gain.setTargetAtTime(0, actx.currentTime, 0.4);
+    setTimeout(() => { try { b.g.disconnect(); b.dl.disconnect(); b.fb.disconnect(); b.lp.disconnect(); } catch (e) {} }, 3500);
+  }
+
+  function applyMusicVol() {
+    if (music.on && music.bus) music.bus.g.gain.setTargetAtTime(musicTarget(), actx.currentTime, 0.1);
+  }
+
+  // ---- Ships, coins and unlocks ----
+  // cost = lifetime coins collected before the ship unlocks (kept in the browser)
+  // pattern = [vertical offset, angle] for each bullet fired; stats = bars shown on the select screen
+  const SHIPS = [
+    { name: 'Scout',     cost: 0,   speed: 330, delay: 0.20, bspeed: 700, dmg: 1, hit: 1,    pattern: [[0, 0]],                         stats: [2, 2, 1, 1], desc: 'Reliable and simple. Every pilot starts here.' },
+    { name: 'Falcon',    cost: 40,  speed: 370, delay: 0.17, bspeed: 720, dmg: 1, hit: 1,    pattern: [[0, 0]],                         stats: [3, 3, 1, 1], desc: 'Quicker on the stick and quicker on the trigger.' },
+    { name: 'Twin Wing', cost: 120, speed: 380, delay: 0.17, bspeed: 720, dmg: 1, hit: 1,    pattern: [[-14, 0], [14, 0]],              stats: [3, 3, 2, 2], desc: 'Two guns side by side cover more sky.' },
+    { name: 'Lancer',    cost: 260, speed: 400, delay: 0.16, bspeed: 850, dmg: 2, hit: 1,    pattern: [[0, 0]],                         stats: [4, 3, 4, 1], desc: 'Heavy bolts crack big rocks in a single shot.' },
+    { name: 'Tri-Star',  cost: 500, speed: 410, delay: 0.15, bspeed: 780, dmg: 1, hit: 1,    pattern: [[0, -0.2], [0, 0], [0, 0.2]],    stats: [4, 4, 3, 4], desc: 'Three-way spread. Watch out for the pods.' },
+    { name: 'Nova',      cost: 900, speed: 440, delay: 0.13, bspeed: 850, dmg: 2, hit: 0.85, pattern: [[0, -0.15], [0, 0], [0, 0.15]],  stats: [5, 5, 5, 5], desc: 'The best ship in the fleet. Fast, strong and hard to hit.' }
+  ];
+  const STAT_LABELS = ['Speed', 'Fire rate', 'Power', 'Spread'];
+
+  let totalCoins = 0, sel = 0, runCoins = 0, runUnlocks = [], toast = null, clock = 0;
+  try {
+    totalCoins = +localStorage.getItem('spaceRocksCoins') || 0;
+    sel = +localStorage.getItem('spaceRocksShip') || 0;
+  } catch (e) {}
+  const unlockedCount = () => SHIPS.filter(s => s.cost <= totalCoins).length;
+  if (!(sel >= 0 && sel < SHIPS.length) || SHIPS[sel].cost > totalCoins) sel = 0;
+
+  const CARD_W = 118, CARD_GAP = 12, CARD_Y = 112, CARD_H = 130;
+  const cardX = i => (W - (SHIPS.length * CARD_W + (SHIPS.length - 1) * CARD_GAP)) / 2 + i * (CARD_W + CARD_GAP);
+  function cardAt(mx, my) {
+    for (let i = 0; i < SHIPS.length; i++) {
+      const x = cardX(i);
+      if (mx >= x && mx <= x + CARD_W && my >= CARD_Y && my <= CARD_Y + CARD_H) return i;
+    }
+    return -1;
+  }
+
+  function rr(x, y, w, h, r) {
+    ctx.beginPath(); ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  }
+
+  function toastMsg(text) { toast = { text, life: 3.5 }; }
+
+  function addCoins(n, silent) {
+    runCoins += n;
+    const before = unlockedCount();
+    totalCoins += n;
+    const after = unlockedCount();
+    if (after > before) {
+      const nm = SHIPS[after - 1].name;
+      runUnlocks.push(nm);
+      toastMsg('New ship unlocked: ' + nm + '!');
+      sfx.unlock();
+    }
+    try { localStorage.setItem('spaceRocksCoins', totalCoins); } catch (e) {}
+  }
+
+  function dropCoins(r) {
+    // small rocks drop a coin now and then, big rocks always drop two
+    const n = r.big ? 2 : (Math.random() < COIN_CHANCE ? 1 : 0);
+    for (let i = 0; i < n; i++) {
+      coins.push({ x: r.x + rand(-8, 8), y: r.y + rand(-8, 8), vx: -Math.max(50, r.speed * 0.5), vy: rand(-25, 25), r: 9, ph: rand(0, 6.28) });
+    }
+  }
+
+  function drawCoin(c) {
+    const sx = Math.abs(Math.cos(clock * 4 + c.ph));
+    ctx.save(); ctx.translate(c.x, c.y); ctx.scale(0.35 + 0.65 * sx, 1);
+    ctx.fillStyle = '#ffd23f'; ctx.strokeStyle = '#b8860b'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0, 0, c.r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#fff3b0'; ctx.fillRect(-1.5, -5, 3, 10);
+    ctx.restore();
+  }
+
+  function fire() {
+    const S = SHIPS[sel];
+    for (const [dy, ang] of S.pattern) {
+      bullets.push({ x: ship.x + 22, y: ship.y + dy, vx: Math.cos(ang) * S.bspeed, vy: Math.sin(ang) * S.bspeed, dmg: S.dmg });
+    }
+  }
+
+  function launchSelected() {
+    if (SHIPS[sel].cost <= totalCoins) startGame(); else sfx.deny();
+  }
+
+  // draws a ship centred on (x, y), nose pointing right
+  function sym(top) {
+    ctx.beginPath();
+    top.forEach(([x, y], i) => i ? ctx.lineTo(x, -y) : ctx.moveTo(x, -y));
+    for (let i = top.length - 1; i >= 0; i--) ctx.lineTo(top[i][0], top[i][1]);
+    ctx.closePath();
+  }
+  function flame(x, col, len) {
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.moveTo(x, -4); ctx.lineTo(x - len - Math.random() * 8, 0); ctx.lineTo(x, 4); ctx.fill();
+  }
+  function drawShipKind(k, x, y, withFlame, scale) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(scale, scale);
+    switch (k) {
+      case 0: // Scout
+        if (withFlame) flame(-12, '#ff9d3a', 14);
+        ctx.fillStyle = '#4fc3f7'; sym([[22, 0], [-18, 13], [-10, 0]]); ctx.fill();
+        ctx.fillStyle = '#e8f7ff'; ctx.beginPath(); ctx.ellipse(2, 0, 8, 4, 0, 0, 7); ctx.fill();
+        break;
+      case 1: // Falcon
+        if (withFlame) flame(-12, '#ffb347', 16);
+        ctx.fillStyle = '#ff5a4d'; sym([[28, 0], [6, 4], [-6, 5], [-22, 16], [-16, 5], [-12, 0]]); ctx.fill();
+        ctx.fillStyle = '#ffb347'; ctx.fillRect(-8, -2, 10, 4);
+        ctx.fillStyle = '#ffe3d6'; ctx.beginPath(); ctx.ellipse(8, 0, 7, 3, 0, 0, 7); ctx.fill();
+        break;
+      case 2: // Twin Wing
+        if (withFlame) flame(-14, '#9dffcf', 12);
+        ctx.fillStyle = '#1f9d5b'; ctx.fillRect(-14, -18, 28, 7); ctx.fillRect(-14, 11, 28, 7); ctx.fillRect(-8, -12, 6, 24);
+        ctx.fillStyle = '#3ddc84'; sym([[26, 0], [4, 6], [-14, 7], [-16, 0]]); ctx.fill();
+        ctx.fillStyle = '#ffe66d'; ctx.fillRect(14, -16, 5, 3); ctx.fillRect(14, 13, 5, 3);
+        ctx.fillStyle = '#eafff3'; ctx.beginPath(); ctx.ellipse(6, 0, 7, 3.5, 0, 0, 7); ctx.fill();
+        break;
+      case 3: // Lancer
+        if (withFlame) flame(-26, '#c9b8ff', 14);
+        ctx.fillStyle = '#7a5cff'; sym([[-6, 5], [-20, 15], [-24, 5]]); ctx.fill();
+        ctx.fillStyle = '#c8bcff'; sym([[34, 0], [10, 4], [-20, 6], [-26, 0]]); ctx.fill();
+        ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.ellipse(8, 0, 6, 2.5, 0, 0, 7); ctx.fill();
+        break;
+      case 4: // Tri-Star
+        if (withFlame) flame(-14, '#ffb347', 14);
+        ctx.fillStyle = '#ffd23f'; ctx.strokeStyle = '#a87b00'; ctx.lineWidth = 2;
+        ctx.beginPath();
+        [[26, 0], [8, -6], [16, -20], [-4, -10], [-18, -12], [-10, 0], [-18, 12], [-4, 10], [16, 20], [8, 6]]
+          .forEach(([px, py], i) => i ? ctx.lineTo(px, py) : ctx.moveTo(px, py));
+        ctx.closePath(); ctx.fill(); ctx.stroke();
+        ctx.fillStyle = '#fff6d1'; ctx.beginPath(); ctx.arc(2, 0, 5, 0, 7); ctx.fill();
+        break;
+      case 5: // Nova
+        if (withFlame) flame(-18, '#4ff0ff', 18);
+        ctx.fillStyle = '#f4f1ff'; ctx.strokeStyle = '#ffcf5a'; ctx.lineWidth = 2;
+        sym([[30, 0], [10, 6], [-2, 8], [-16, 20], [-24, 14], [-14, 5], [-20, 0]]); ctx.fill(); ctx.stroke();
+        ctx.save(); ctx.shadowColor = '#4ff0ff'; ctx.shadowBlur = 12; ctx.fillStyle = '#4ff0ff';
+        ctx.beginPath(); ctx.arc(2, 0, 5, 0, 7); ctx.fill(); ctx.restore();
+        break;
+    }
+    ctx.restore();
+  }
+
+  function drawSelect() {
+    ctx.fillStyle = 'rgba(5,5,20,.78)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 42px system-ui, sans-serif'; ctx.fillText('SPACE ROCKS', W / 2, 58);
+    ctx.fillStyle = '#a9acc9'; ctx.font = '16px system-ui, sans-serif';
+    ctx.fillText('Choose your ship. Collect coins to unlock better ones.', W / 2, 86);
+
+    SHIPS.forEach((S, i) => {
+      const x = cardX(i), locked = S.cost > totalCoins, on = i === sel;
+      ctx.fillStyle = on ? 'rgba(79,195,247,.16)' : 'rgba(255,255,255,.05)';
+      rr(x, CARD_Y, CARD_W, CARD_H, 10); ctx.fill();
+      ctx.strokeStyle = on ? '#4fc3f7' : '#2a2a55'; ctx.lineWidth = on ? 2.5 : 1; ctx.stroke();
+      ctx.save(); if (locked) ctx.globalAlpha = 0.28;
+      drawShipKind(i, x + CARD_W / 2 + 4, CARD_Y + 52, !locked, 1.15);
+      ctx.restore();
+      ctx.font = 'bold 14px system-ui, sans-serif'; ctx.fillStyle = locked ? '#7c7f9c' : '#fff';
+      ctx.fillText(S.name, x + CARD_W / 2, CARD_Y + 98);
+      ctx.font = '12px system-ui, sans-serif'; ctx.fillStyle = locked ? '#ffd23f' : '#4dff9a';
+      ctx.fillText(locked ? S.cost + ' coins' : 'Unlocked', x + CARD_W / 2, CARD_Y + 117);
+    });
+
+    const S = SHIPS[sel], locked = S.cost > totalCoins;
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 28px system-ui, sans-serif'; ctx.fillText(S.name, W / 2, 288);
+    ctx.fillStyle = '#a9acc9'; ctx.font = '16px system-ui, sans-serif'; ctx.fillText(S.desc, W / 2, 314);
+    STAT_LABELS.forEach((lb, i) => {
+      const bx = W / 2 - 200 + (i % 2) * 220, by = 336 + Math.floor(i / 2) * 28;
+      ctx.textAlign = 'left'; ctx.font = '14px system-ui, sans-serif'; ctx.fillStyle = '#cfd2ee';
+      ctx.fillText(lb, bx, by + 10);
+      for (let k = 0; k < 5; k++) {
+        ctx.fillStyle = k < S.stats[i] ? '#4fc3f7' : 'rgba(255,255,255,.12)';
+        ctx.fillRect(bx + 84 + k * 22, by, 18, 10);
+      }
+    });
+
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#ffd23f'; ctx.beginPath(); ctx.arc(W / 2 - 70, 412, 8, 0, 7); ctx.fill();
+    ctx.font = 'bold 18px system-ui, sans-serif'; ctx.fillText('Coins: ' + totalCoins, W / 2 - 54, 418);
+    ctx.textAlign = 'center';
+    const next = SHIPS.find(s => s.cost > totalCoins);
+    ctx.font = '13px system-ui, sans-serif';
+    if (next) {
+      const prev = SHIPS[SHIPS.indexOf(next) - 1].cost;
+      const frac = Math.max(0, Math.min(1, (totalCoins - prev) / (next.cost - prev)));
+      ctx.fillStyle = 'rgba(255,255,255,.12)'; ctx.fillRect(W / 2 - 150, 432, 300, 8);
+      ctx.fillStyle = '#ffd23f'; ctx.fillRect(W / 2 - 150, 432, 300 * frac, 8);
+      ctx.fillStyle = '#a9acc9';
+      ctx.fillText('Next ship: ' + next.name + ' at ' + next.cost + ' coins (' + (next.cost - totalCoins) + ' to go)', W / 2, 458);
+    } else {
+      ctx.fillStyle = '#4dff9a'; ctx.fillText('Every ship unlocked!', W / 2, 458);
+    }
+    ctx.font = 'bold 18px system-ui, sans-serif';
+    if (locked) { ctx.fillStyle = '#ff8a80'; ctx.fillText('Locked: ' + (S.cost - totalCoins) + ' more coins to unlock', W / 2, 496); }
+    else { ctx.fillStyle = '#fff'; ctx.fillText('Press Space to launch  ·  ← → to choose', W / 2, 496); }
+  }
+
+  stars = Array.from({ length: 90 }, () => ({ x: rand(0, W), y: rand(0, H), z: rand(0.2, 1) }));
+
+  function startGame() {
+    const S = SHIPS[sel];
+    ship = { x: 80, y: H / 2, w: 38 * S.hit, h: 24 * S.hit };
+    try { localStorage.setItem('spaceRocksShip', sel); } catch (e) {}
+    bullets = []; rocks = []; particles = []; coins = [];
+    runCoins = 0; runUnlocks = []; toast = null;
+    round = 1; score = 0; strikes = 0; friends = [];
+    startMusic();
+    beginRound();
+  }
+
+  function beginRound() {
+    destroyed = 0;
+    quota = QUOTA_BASE + (round - 1) * QUOTA_PER_ROUND;
+    spawnTimer = 1; fireTimer = 0;
+    rocks = []; bullets = []; friends = []; coins = [];
+    state = 'banner'; bannerTime = 2;
+    if (round > 1) music.switchNow = true; // new round, new theme
+  }
+
+  function spawnRock() {
+    const r = rand(18, 34);
+    const big = round >= 3 && r > 28;           // big rocks take 2 hits from round 3 on
+    const pts = Array.from({ length: 9 }, (_, i) => {
+      const a = (i / 9) * Math.PI * 2;
+      return [Math.cos(a) * r * rand(0.75, 1.1), Math.sin(a) * r * rand(0.75, 1.1)];
+    });
+    rocks.push({
+      x: W + r, y: rand(r + 30, H - r - 10), r, pts, big,
+      hp: big ? 2 : 1,
+      speed: (ROCK_BASE_SPEED + (round - 1) * ROCK_SPEED_PER_ROUND) * rand(0.85, 1.2),
+      rot: rand(0, 6.28), spin: rand(-2, 2),
+      drift: round >= 2 ? rand(-30, 30) * Math.min(round, 6) / 3 : 0 // wobbly paths in later rounds
+    });
+  }
+
+  function spawnFriend() {
+    const r = 20;
+    friends.push({
+      x: W + r, y: rand(r + 40, H - r - 10), r,
+      speed: (ROCK_BASE_SPEED + (round - 1) * ROCK_SPEED_PER_ROUND) * rand(0.8, 1.0)
+    });
+  }
+
+  function boom(x, y, n, col) {
+    for (let i = 0; i < n; i++) {
+      const a = rand(0, 6.28), s = rand(40, 220);
+      particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rand(.3, .7), col });
+    }
+  }
+
+  function lose(reason) {
+    state = 'dead'; deadReason = reason; sfx.over(); stopMusic();
+    boom(ship.x, ship.y, 40, '#ff9d3a');
+    if (score > best) {
+      best = score;
+      try { localStorage.setItem('spaceRocksBest', best); } catch (e) {}
+    }
+  }
+
+  function update(dt) {
+    // ship movement
+    const dx = (keys.ArrowRight ? 1 : 0) - (keys.ArrowLeft ? 1 : 0);
+    const dy = (keys.ArrowDown ? 1 : 0) - (keys.ArrowUp ? 1 : 0);
+    const len = Math.hypot(dx, dy) || 1;
+    ship.x = Math.min(W - 30, Math.max(30, ship.x + (dx / len) * SHIPS[sel].speed * dt));
+    ship.y = Math.min(H - 20, Math.max(20, ship.y + (dy / len) * SHIPS[sel].speed * dt));
+
+    // shooting
+    fireTimer -= dt;
+    if (keys[' '] && fireTimer <= 0) {
+      fire();
+      sfx.blast();
+      fireTimer = SHIPS[sel].delay;
+    }
+    for (const b of bullets) { b.x += b.vx * dt; b.y += b.vy * dt; }
+    bullets = bullets.filter(b => b.x < W + 20 && b.y > -20 && b.y < H + 20);
+
+    // spawning (stop spawning once enough are coming to meet the quota)
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) {
+      if (Math.random() < FRIEND_CHANCE) spawnFriend(); else spawnRock();
+      spawnTimer = Math.max(SPAWN_MIN, SPAWN_BASE - (round - 1) * SPAWN_DROP_PER_ROUND) * rand(0.7, 1.3);
+    }
+
+    // rocks
+    for (const r of rocks) {
+      r.x -= r.speed * dt;
+      r.y += r.drift * dt;
+      if (r.y < r.r + 5 || r.y > H - r.r - 5) r.drift *= -1;
+      r.rot += r.spin * dt;
+    }
+
+    // bullet vs rock
+    for (const b of bullets) {
+      for (const r of rocks) {
+        if (r.hp > 0 && Math.hypot(b.x - r.x, b.y - r.y) < r.r + 6) {
+          b.dead = true; r.hp -= b.dmg;
+          if (r.hp <= 0) {
+            r.dead = true; destroyed++; score += r.big ? 25 : 10; dropCoins(r);
+            boom(r.x, r.y, 14, '#c9b79c'); sfx.shatter(r.big);
+          } else { boom(b.x, b.y, 5, '#fff'); sfx.hit(); }
+          break;
+        }
+      }
+    }
+    bullets = bullets.filter(b => !b.dead);
+    rocks = rocks.filter(r => !r.dead);
+
+    // coins drift left; fly into them to collect
+    for (const c of coins) {
+      c.x += c.vx * dt; c.y = Math.min(H - 20, Math.max(40, c.y + c.vy * dt)); c.vy *= 0.98;
+      if (Math.hypot(c.x - ship.x, c.y - ship.y) < c.r + 18) { c.dead = true; addCoins(1); sfx.coin(); }
+    }
+    coins = coins.filter(c => !c.dead && c.x > -20);
+
+    // friendly pods: fly by harmlessly, but shooting one is a strike
+    for (const f of friends) f.x -= f.speed * dt;
+    for (const b of bullets) {
+      for (const f of friends) {
+        if (!f.dead && Math.hypot(b.x - f.x, b.y - f.y) < f.r) {
+          b.dead = true; f.dead = true; strikes++;
+          score = Math.max(0, score - FRIEND_PENALTY);
+          boom(f.x, f.y, 24, '#ff4d4d');
+          sfx.strike();
+          break;
+        }
+      }
+    }
+    bullets = bullets.filter(b => !b.dead);
+    friends = friends.filter(f => !f.dead && f.x + f.r > -40);
+    if (strikes >= MAX_STRIKES) { lose('You shot too many supply pods!'); return; }
+
+    // rock hits the ship
+    for (const r of rocks) {
+      if (Math.abs(r.x - ship.x) < r.r * 0.8 + ship.w / 2 - 4 && Math.abs(r.y - ship.y) < r.r * 0.8 + ship.h / 2 - 2) {
+        lose('Your ship was smashed!'); return;
+      }
+    }
+    // rock gets past on the left = lose
+    for (const r of rocks) {
+      if (r.x + r.r < 0) { lose('A rock got past you!'); return; }
+    }
+
+    // round complete
+    if (destroyed >= quota) {
+      score += round * 50;
+      for (const c of coins) addCoins(1, true);
+      addCoins(ROUND_BONUS, true);
+      sfx.round();
+      round++;
+      beginRound();
+    }
+  }
+
+  function drawRock(r) {
+    ctx.save(); ctx.translate(r.x, r.y); ctx.rotate(r.rot);
+    ctx.fillStyle = r.big ? '#8a7a68' : '#a8957c';
+    ctx.strokeStyle = '#5b4d3d'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    r.pts.forEach(([px, py], i) => i ? ctx.lineTo(px, py) : ctx.moveTo(px, py));
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    if (r.big && r.hp === 1) { // cracked look after first hit
+      ctx.beginPath(); ctx.moveTo(-r.r * .4, -r.r * .3); ctx.lineTo(r.r * .1, r.r * .1); ctx.lineTo(r.r * .4, r.r * .5); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawFriend(f) {
+    ctx.save(); ctx.translate(f.x, f.y);
+    ctx.shadowColor = '#4dff9a'; ctx.shadowBlur = 14;
+    ctx.fillStyle = '#2ecc71'; ctx.strokeStyle = '#c8ffe0'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(0, 0, f.r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#fff'; ctx.fillRect(-3, -11, 6, 22); ctx.fillRect(-11, -3, 22, 6);
+    ctx.restore();
+  }
+
+  function draw(dt) {
+    clock += dt;
+    ctx.fillStyle = '#05050f'; ctx.fillRect(0, 0, W, H);
+    // stars scroll faster as rounds go up
+    const sp = 20 + (round || 1) * 12;
+    ctx.fillStyle = '#fff';
+    for (const s of stars) {
+      s.x -= sp * s.z * dt;
+      if (s.x < 0) { s.x = W; s.y = rand(0, H); }
+      ctx.globalAlpha = 0.3 + s.z * 0.7;
+      ctx.fillRect(s.x, s.y, s.z * 2 + 0.5, s.z * 2 + 0.5);
+    }
+    ctx.globalAlpha = 1;
+
+    // red danger line at left edge
+    ctx.fillStyle = 'rgba(255,60,60,.25)'; ctx.fillRect(0, 0, 6, H);
+
+    if (ship && state !== 'ready') {
+      for (const r of rocks) drawRock(r);
+      for (const f of friends) drawFriend(f);
+      for (const c of coins) drawCoin(c);
+      for (const b of bullets) {
+        ctx.save(); ctx.translate(b.x, b.y); ctx.rotate(Math.atan2(b.vy, b.vx));
+        ctx.fillStyle = b.dmg > 1 ? '#7df9ff' : '#ffe66d';
+        ctx.fillRect(-9, b.dmg > 1 ? -3 : -2, 18, b.dmg > 1 ? 6 : 4);
+        ctx.restore();
+      }
+      if (state !== 'dead') drawShipKind(sel, ship.x, ship.y, true, 1);
+    }
+    for (const p of particles) {
+      p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+      ctx.globalAlpha = Math.max(0, p.life * 2); ctx.fillStyle = p.col; ctx.fillRect(p.x, p.y, 3, 3);
+    }
+    ctx.globalAlpha = 1;
+    particles = particles.filter(p => p.life > 0);
+
+    // HUD
+    if (state !== 'ready') {
+      ctx.font = 'bold 18px system-ui, sans-serif'; ctx.fillStyle = '#fff';
+      ctx.textAlign = 'left'; ctx.fillText('Round ' + round + '   Strikes ' + strikes + '/' + MAX_STRIKES, 18, 28);
+      ctx.textAlign = 'center'; ctx.fillText('Rocks: ' + destroyed + ' / ' + quota, W / 2, 28);
+      ctx.textAlign = 'right'; ctx.fillText('Score ' + score + '   Best ' + best, W - 14, 28);
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#ffd23f'; ctx.beginPath(); ctx.arc(26, 50, 7, 0, 7); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 16px system-ui, sans-serif';
+      ctx.fillText('+' + runCoins + '   (total ' + totalCoins + ')', 40, 56);
+      if (toast) {
+        toast.life -= dt;
+        if (toast.life <= 0) toast = null;
+        else {
+          ctx.globalAlpha = Math.min(1, toast.life * 2);
+          ctx.font = 'bold 20px system-ui, sans-serif';
+          const tw = ctx.measureText(toast.text).width + 36;
+          ctx.fillStyle = '#ffd23f'; rr(W / 2 - tw / 2, 70, tw, 38, 10); ctx.fill();
+          ctx.fillStyle = '#1b1b2f'; ctx.textAlign = 'center'; ctx.fillText(toast.text, W / 2, 96);
+          ctx.globalAlpha = 1;
+        }
+      }
+    }
+  }
+
+  function overlay(title, sub, sub2, sub3) {
+    ctx.fillStyle = 'rgba(5,5,20,.7)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'center';
+    ctx.font = 'bold 48px system-ui, sans-serif'; ctx.fillText(title, W / 2, H / 2 - 14);
+    ctx.font = '20px system-ui, sans-serif'; ctx.fillText(sub, W / 2, H / 2 + 26);
+    if (sub2) ctx.fillText(sub2, W / 2, H / 2 + 56);
+    if (sub3) { ctx.fillStyle = '#ffd23f'; ctx.fillText(sub3, W / 2, H / 2 + 88); }
+  }
+
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    if (state === 'playing') update(dt);
+    if (state === 'banner') {
+      // ship can move and shoot freely during the banner so it feels responsive
+      const dx = (keys.ArrowRight ? 1 : 0) - (keys.ArrowLeft ? 1 : 0);
+      const dy = (keys.ArrowDown ? 1 : 0) - (keys.ArrowUp ? 1 : 0);
+      const len = Math.hypot(dx, dy) || 1;
+      ship.x = Math.min(W - 30, Math.max(30, ship.x + (dx / len) * SHIPS[sel].speed * dt));
+      ship.y = Math.min(H - 20, Math.max(20, ship.y + (dy / len) * SHIPS[sel].speed * dt));
+      bannerTime -= dt;
+      if (bannerTime <= 0) state = 'playing';
+    }
+    draw(dt);
+    if (state === 'ready') drawSelect();
+    if (state === 'banner') overlay('ROUND ' + round, 'Destroy ' + quota + ' rocks', (round > 1 ? 'Faster and tougher! ' : '') + "Don't shoot the green pods!");
+    if (state === 'dead') overlay('GAME OVER', deadReason, 'Round ' + round + ' · Score ' + score + ' · Coins +' + runCoins + ' · Press Space to pick a ship', runUnlocks.length ? 'New ship unlocked: ' + runUnlocks.join(', ') + '!' : '');
+    requestAnimationFrame(frame);
+  }
+
+  addEventListener('keydown', e => {
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
+    keys[e.key] = true;
+    initAudio();
+    if ((e.key === 'm' || e.key === 'M') && !e.repeat) { muted = !muted; applyMusicVol(); }
+    if ((e.key === 'n' || e.key === 'N') && !e.repeat) { musicOff = !musicOff; applyMusicVol(); }
+    if (state === 'ready' && !e.repeat) {
+      if (e.key === 'ArrowLeft') sel = (sel + SHIPS.length - 1) % SHIPS.length;
+      else if (e.key === 'ArrowRight') sel = (sel + 1) % SHIPS.length;
+      else if (e.key === ' ' || e.key === 'Enter') launchSelected();
+    } else if (state === 'dead' && (e.key === ' ' || e.key === 'Enter') && !e.repeat) state = 'ready';
+  });
+  addEventListener('keyup', e => { keys[e.key] = false; });
+  addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+  // show the ship on the title screen
+  ship = { x: 80, y: H / 2, w: 38, h: 24 };
+  bullets = []; rocks = []; particles = [];
+  round = 1; score = 0; destroyed = 0; quota = QUOTA_BASE;
+
+  cv.addEventListener('pointerdown', e => {
+    cv.focus();
+    if (state !== 'ready') return;
+    const b = cv.getBoundingClientRect();
+    const i = cardAt((e.clientX - b.left) * W / b.width, (e.clientY - b.top) * H / b.height);
+    if (i < 0) return;
+    if (i === sel) launchSelected(); else sel = i;
+  });
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
